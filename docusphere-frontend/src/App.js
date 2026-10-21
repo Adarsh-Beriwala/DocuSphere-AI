@@ -1,254 +1,363 @@
-import { useState, useRef, useEffect } from "react";
-import axios from "axios";
-import ReactMarkdown from "react-markdown";
+import { useCallback, useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import api, { errorMessage } from './api';
 
-const API_URL = "http://127.0.0.1:8000";
+const LOGO = '⬡';
+const STORAGE_TOKEN = 'docusphere_token';
 
-export default function App() {
-  const [url, setUrl] = useState("");
-  const [file, setFile] = useState(null);
-  const [ingestStatus, setIngestStatus] = useState(null);
-  const [ingestLoading, setIngestLoading] = useState(false);
-  const [docs, setDocs] = useState([]);
-  const [question, setQuestion] = useState("");
-  const [messages, setMessages] = useState([]);
-  const [queryLoading, setQueryLoading] = useState(false);
-  const messagesEndRef = useRef(null);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  const ingestUrl = async () => {
-    if (!url.trim()) return;
-    setIngestLoading(true);
-    setIngestStatus(null);
-    try {
-      const res = await axios.post(`${API_URL}/ingest/url`, { url });
-      setIngestStatus({ type: "success", msg: `✓ ${res.data.chunks_created} chunks ingested from URL` });
-      setDocs((prev) => [...prev, { name: url.split("/").pop() || url, type: "url" }]);
-      setUrl("");
-    } catch (err) {
-      setIngestStatus({ type: "error", msg: err.response?.data?.detail || "URL ingestion failed" });
+/**
+ * Convert only prose [1], [2], 【1】, 【2】 etc. into clickable source references.
+ * Ignore Markdown code nodes, existing links and out-of-range reference numbers.
+ * The LLM's references are NOT verified factual citations.
+ */
+function inlineSourceCitationPlugin({ maxNumber, messageIndex }) {
+  return (tree) => {
+    const idPrefix = `citation-source-${messageIndex}-`;
+    function walk(node) {
+      if (!Array.isArray(node.children)) return;
+      const next = [];
+      for (const child of node.children) {
+        if (child.type !== 'text') {
+          if (!['link', 'linkReference', 'code', 'inlineCode'].includes(child.type)) walk(child);
+          next.push(child);
+          continue;
+        }
+        const text = child.value || '';
+        const matcher = /\[(\d{1,2})\]|【(\d{1,2})】/g;
+        let lastIndex = 0;
+        let found = false;
+        let match;
+        while ((match = matcher.exec(text)) !== null) {
+          const number = Number(match[1] || match[2]);
+          if (number < 1 || number > maxNumber) continue;
+          found = true;
+          if (match.index > lastIndex) {
+            next.push({ type: 'text', value: text.slice(lastIndex, match.index) });
+          }
+          next.push({
+            type: 'link',
+            url: `#${idPrefix}${number}`,
+            title: `Open source excerpt ${number}`,
+            children: [{ type: 'text', value: `[${number}]` }],
+          });
+          lastIndex = matcher.lastIndex;
+        }
+        if (!found) next.push(child);
+        else if (lastIndex < text.length) next.push({ type: 'text', value: text.slice(lastIndex) });
+      }
+      node.children = next;
     }
-    setIngestLoading(false);
+    walk(tree);
   };
-
-  const ingestPdf = async () => {
-    if (!file) return;
-    setIngestLoading(true);
-    setIngestStatus(null);
-    const formData = new FormData();
-    formData.append("file", file);
-    try {
-      const res = await axios.post(`${API_URL}/ingest/pdf`, formData);
-      setIngestStatus({ type: "success", msg: `✓ ${res.data.chunks_created} chunks ingested from PDF` });
-      setDocs((prev) => [...prev, { name: file.name, type: "pdf" }]);
-      setFile(null);
-      document.querySelector('input[type="file"]').value = "";
-    } catch (err) {
-      setIngestStatus({ type: "error", msg: err.response?.data?.detail || "PDF ingestion failed" });
-    }
-    setIngestLoading(false);
-  };
-
-  const sendQuery = async () => {
-    if (!question.trim() || queryLoading) return;
-    const q = question.trim();
-    setMessages((prev) => [...prev, { role: "user", text: q }]);
-    setQuestion("");
-    setQueryLoading(true);
-    try {
-      const res = await axios.post(`${API_URL}/query`, { question: q });
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "ai",
-          text: res.data.answer,
-          sources: res.data.sources,
-          confidence: res.data.confidence,
-        },
-      ]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", text: "Something went wrong. Please try again.", sources: [], confidence: "low" },
-      ]);
-    }
-    setQueryLoading(false);
-  };
-
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendQuery();
-    }
-  };
-
-  return (
-    <div style={styles.root}>
-      <div style={styles.sidebar}>
-        <div style={styles.logo}>
-          <span style={styles.logoIcon}>⬡</span>
-          <span style={styles.logoText}>DocuSphere</span>
-        </div>
-        <p style={styles.logoSub}>AI Documentation Assistant</p>
-        <div style={styles.divider} />
-        <p style={styles.sectionLabel}>INGEST URL</p>
-        <input
-          style={styles.input}
-          placeholder="https://docs.example.com/..."
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && ingestUrl()}
-        />
-        <button
-          style={{ ...styles.btn, opacity: ingestLoading ? 0.6 : 1 }}
-          onClick={ingestUrl}
-          disabled={ingestLoading}
-        >
-          {ingestLoading ? "Ingesting..." : "Ingest URL"}
-        </button>
-        <p style={{ ...styles.sectionLabel, marginTop: "1.25rem" }}>UPLOAD PDF</p>
-        <label style={styles.fileLabel}>
-          <input
-            type="file"
-            accept=".pdf"
-            style={{ display: "none" }}
-            onChange={(e) => setFile(e.target.files[0])}
-          />
-          {file ? file.name : "Choose PDF file"}
-        </label>
-        <button
-          style={{ ...styles.btn, opacity: !file || ingestLoading ? 0.5 : 1 }}
-          onClick={ingestPdf}
-          disabled={!file || ingestLoading}
-        >
-          {ingestLoading ? "Ingesting..." : "Ingest PDF"}
-        </button>
-        {ingestStatus && (
-          <div style={{ ...styles.statusBox, background: ingestStatus.type === "success" ? "#0f2d1a" : "#2d0f0f", color: ingestStatus.type === "success" ? "#4ade80" : "#f87171" }}>
-            {ingestStatus.msg}
-          </div>
-        )}
-        <div style={styles.divider} />
-        <p style={styles.sectionLabel}>INGESTED DOCS</p>
-        {docs.length === 0 ? (
-          <p style={styles.emptyDocs}>No documents yet</p>
-        ) : (
-          docs.map((d, i) => (
-            <div key={i} style={styles.docItem}>
-              <span style={styles.docIcon}>{d.type === "pdf" ? "📄" : "🔗"}</span>
-              <span style={styles.docName}>{d.name}</span>
-            </div>
-          ))
-        )}
-      </div>
-
-      <div style={styles.main}>
-        <div style={styles.chatHeader}>
-          <p style={styles.chatTitle}>Ask your documentation</p>
-          <p style={styles.chatSub}>Answers are grounded in your ingested documents only</p>
-        </div>
-        <div style={styles.messages}>
-          {messages.length === 0 && (
-            <div style={styles.emptyChat}>
-              <p style={styles.emptyChatIcon}>⬡</p>
-              <p style={styles.emptyChatText}>Ingest a document and start asking questions</p>
-            </div>
-          )}
-          {messages.map((msg, i) => (
-            <div key={i} style={{ ...styles.msgRow, justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
-              <div style={msg.role === "user" ? styles.userBubble : styles.aiBubble}>
-                {msg.role === "ai" ? (
-                  <ReactMarkdown>{msg.text}</ReactMarkdown>
-                ) : (
-                  <p style={styles.msgText}>{msg.text}</p>
-                )}
-                {msg.role === "ai" && msg.sources && msg.sources.length > 0 && (
-                  <div style={styles.sources}>
-                    {msg.sources.map((s, si) => (
-                      <details key={si} style={styles.sourceItem}>
-                        <summary style={styles.sourceSummary}>📎 {s.document.split("/").pop() || s.document}</summary>
-                        <p style={styles.sourceExcerpt}>{s.excerpt}</p>
-                      </details>
-                    ))}
-                  </div>
-                )}
-                {msg.role === "ai" && (
-                  <span style={{ ...styles.confidenceBadge, background: msg.confidence === "high" ? "#0f2d1a" : "#2d0f0f", color: msg.confidence === "high" ? "#4ade80" : "#f87171" }}>
-                    {msg.confidence === "high" ? "✓ Grounded" : "⚠ No match"}
-                  </span>
-                )}
-              </div>
-            </div>
-          ))}
-          {queryLoading && (
-            <div style={{ ...styles.msgRow, justifyContent: "flex-start" }}>
-              <div style={styles.aiBubble}>
-                <p style={{ ...styles.msgText, opacity: 0.5 }}>Thinking...</p>
-              </div>
-            </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-        <div style={styles.inputRow}>
-          <textarea
-            style={styles.chatInput}
-            placeholder="Ask a question about your documentation..."
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={handleKeyDown}
-            rows={1}
-          />
-          <button
-            style={{ ...styles.sendBtn, opacity: !question.trim() || queryLoading ? 0.4 : 1 }}
-            onClick={sendQuery}
-            disabled={!question.trim() || queryLoading}
-          >
-            ↑
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 }
 
-const styles = {
-  root: { display: "flex", height: "100vh", background: "#0a0a0a", color: "#e5e5e5", fontFamily: "'Segoe UI', sans-serif" },
-  sidebar: { width: "280px", minWidth: "280px", background: "#111111", borderRight: "1px solid #222", padding: "1.5rem 1.25rem", overflowY: "auto", display: "flex", flexDirection: "column" },
-  logo: { display: "flex", alignItems: "center", gap: "8px" },
-  logoIcon: { fontSize: "22px", color: "#6366f1" },
-  logoText: { fontSize: "18px", fontWeight: "600", color: "#fff" },
-  logoSub: { fontSize: "12px", color: "#555", marginTop: "4px" },
-  divider: { borderTop: "1px solid #222", margin: "1.25rem 0" },
-  sectionLabel: { fontSize: "10px", fontWeight: "600", letterSpacing: "0.1em", color: "#444", marginBottom: "8px" },
-  input: { width: "100%", background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: "8px", padding: "8px 12px", color: "#e5e5e5", fontSize: "13px", outline: "none", boxSizing: "border-box", marginBottom: "8px" },
-  btn: { width: "100%", background: "#6366f1", border: "none", borderRadius: "8px", padding: "9px", color: "#fff", fontSize: "13px", fontWeight: "500", cursor: "pointer" },
-  fileLabel: { display: "block", width: "100%", background: "#1a1a1a", border: "1px dashed #2a2a2a", borderRadius: "8px", padding: "8px 12px", color: "#555", fontSize: "13px", cursor: "pointer", boxSizing: "border-box", marginBottom: "8px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  statusBox: { marginTop: "10px", padding: "8px 12px", borderRadius: "8px", fontSize: "12px" },
-  emptyDocs: { fontSize: "12px", color: "#333" },
-  docItem: { display: "flex", alignItems: "center", gap: "8px", padding: "6px 0", borderBottom: "1px solid #1a1a1a" },
-  docIcon: { fontSize: "14px" },
-  docName: { fontSize: "12px", color: "#888", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  main: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" },
-  chatHeader: { padding: "1.25rem 1.5rem", borderBottom: "1px solid #1a1a1a" },
-  chatTitle: { fontSize: "16px", fontWeight: "600", color: "#fff" },
-  chatSub: { fontSize: "12px", color: "#444", marginTop: "2px" },
-  messages: { flex: 1, overflowY: "auto", padding: "1.5rem", display: "flex", flexDirection: "column", gap: "12px" },
-  emptyChat: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", opacity: 0.3, marginTop: "6rem" },
-  emptyChatIcon: { fontSize: "48px", marginBottom: "12px" },
-  emptyChatText: { fontSize: "14px", color: "#888" },
-  msgRow: { display: "flex" },
-  userBubble: { background: "#6366f1", borderRadius: "16px 16px 4px 16px", padding: "10px 16px", maxWidth: "70%" },
-  aiBubble: { background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: "16px 16px 16px 4px", padding: "10px 16px", maxWidth: "75%" },
- msgText: { fontSize: "14px", lineHeight: "1.6", margin: 0, wordBreak: "break-word" },
-  sources: { marginTop: "10px", borderTop: "1px solid #2a2a2a", paddingTop: "8px" },
-  sourceItem: { marginBottom: "4px" },
-  sourceSummary: { fontSize: "11px", color: "#6366f1", cursor: "pointer" },
-  sourceExcerpt: { fontSize: "11px", color: "#555", marginTop: "4px", lineHeight: "1.5", paddingLeft: "8px" },
-  confidenceBadge: { display: "inline-block", fontSize: "10px", padding: "2px 8px", borderRadius: "20px", marginTop: "8px" },
-  inputRow: { padding: "1rem 1.5rem", borderTop: "1px solid #1a1a1a", display: "flex", gap: "10px", alignItems: "flex-end" },
-  chatInput: { flex: 1, background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: "12px", padding: "12px 16px", color: "#e5e5e5", fontSize: "14px", outline: "none", resize: "none", fontFamily: "inherit" },
-  sendBtn: { width: "42px", height: "42px", background: "#6366f1", border: "none", borderRadius: "12px", color: "#fff", fontSize: "18px", cursor: "pointer", flexShrink: 0 },
-};
+function MarkdownLink({ href, children }) {
+  const isSourceLink = typeof href === 'string' && /^#citation-source-\d+-\d+$/.test(href);
+  if (isSourceLink) {
+    return <a href={href} className="inline-citation" onClick={event => {
+      event.preventDefault();
+      const card = document.getElementById(href.slice(1));
+      if (card) {
+        card.open = true;
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }} title="Open matching source excerpt">{children}</a>;
+  }
+  // URLs generated by an LLM should never be treated as trusted citations.
+  return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+}
+
+
+function AuthScreen({ onAuthenticated }) {
+  const [mode, setMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      const endpoint = mode === 'login' ? '/auth/login' : '/auth/register';
+      const { data } = await api.post(endpoint, { email, password });
+      sessionStorage.setItem(STORAGE_TOKEN, data.access_token);
+      onAuthenticated(data.user);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="auth-page">
+    <div className="auth-glow" />
+    <div className="auth-card">
+      <div className="brand-center"><span className="brand-mark">{LOGO}</span><span>DocuSphere <b>AI</b></span></div>
+      <div className="auth-eyebrow">YOUR PRIVATE DOCUMENT WORKSPACE</div>
+      <h1>{mode === 'login' ? 'Welcome back' : 'Create your account'}</h1>
+      <p className="muted">Ask better questions. Get answers grounded in your own documents.</p>
+      <form onSubmit={submit} className="auth-form">
+        <label>Email address<input type="email" autoComplete="email" value={email} required
+          onChange={e => setEmail(e.target.value)} placeholder="you@example.com" /></label>
+        <label>Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+          minLength={8} maxLength={128} value={password} required onChange={e => setPassword(e.target.value)}
+          placeholder="At least 8 characters" /></label>
+        {error && <div role="alert" className="alert error">{error}</div>}
+        <button className="primary wide" disabled={busy}>{busy ? 'Please wait...' : mode === 'login' ? 'Sign in →' : 'Create account →'}</button>
+      </form>
+      <div className="auth-switch">
+        {mode === 'login' ? "Don't have an account?" : 'Already have an account?'}{' '}
+        <button className="link-button" type="button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>
+          {mode === 'login' ? 'Sign up' : 'Sign in'}
+        </button>
+      </div>
+      <p className="fineprint">Local development demo · Keep private files on your own machine</p>
+    </div>
+  </div>;
+}
+
+function SourceReference({ source, index, messageIndex }) {
+  return <details id={`citation-source-${messageIndex}-${index + 1}`} className="source-card">
+    <summary><span className="source-index">{index + 1}</span><span className="source-title">{source.document}
+      {source.page ? ` · p. ${source.page}` : ''}</span><span className="chevron">⌄</span></summary>
+    <div className="source-body">{source.excerpt}</div>
+  </details>;
+}
+
+function Workspace({ user, onLogout }) {
+  const [docs, setDocs] = useState([]);
+  const [url, setUrl] = useState('');
+  const [file, setFile] = useState(null);
+  const [ingesting, setIngesting] = useState(false);
+  const [docBusy, setDocBusy] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [question, setQuestion] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [clearingChat, setClearingChat] = useState(false);
+  const [queryBusy, setQueryBusy] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const bottomRef = useRef(null);
+  const fileRef = useRef(null);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, queryBusy]);
+  useEffect(() => {
+    let active = true;
+    api.get('/documents').then(({ data }) => { if (active) setDocs(data.documents || []); })
+      .catch(err => { if (active && err.response?.status === 401) onLogout(); });
+    api.get('/chat/history')
+      .then(({ data }) => { if (active) setMessages(data.messages || []); })
+      .catch(err => {
+        if (!active) return;
+        if (err.response?.status === 401) onLogout();
+        else setStatus({ type: 'error', text: 'Could not load saved chat: ' + errorMessage(err) });
+      })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => { active = false; };
+  }, [onLogout]);
+
+  function catchError(err) {
+    if (err.response?.status === 401) { onLogout(); return 'Session expired. Please sign in again.'; }
+    return errorMessage(err);
+  }
+
+  async function reloadDocs() {
+    const { data } = await api.get('/documents');
+    setDocs(data.documents || []);
+  }
+
+  async function ingestPdf(e) {
+    e.preventDefault();
+    if (!file || ingesting) return;
+    setIngesting(true); setStatus(null);
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const { data } = await api.post('/ingest/pdf', formData, { timeout: 180000 });
+      await reloadDocs();
+      setStatus({ type: 'success', text: `Added ${data.name} · ${data.chunks_created} chunks` });
+      setFile(null); if (fileRef.current) fileRef.current.value = '';
+    } catch (err) { setStatus({ type: 'error', text: catchError(err) }); }
+    finally { setIngesting(false); }
+  }
+
+  async function ingestUrl(e) {
+    e.preventDefault();
+    if (!url.trim() || ingesting) return;
+    setIngesting(true); setStatus(null);
+    try {
+      const { data } = await api.post('/ingest/url', { url: url.trim() }, { timeout: 180000 });
+      await reloadDocs();
+      setStatus({ type: 'success', text: `Added webpage · ${data.chunks_created} chunks` });
+      setUrl('');
+    } catch (err) { setStatus({ type: 'error', text: catchError(err) }); }
+    finally { setIngesting(false); }
+  }
+
+  async function deleteDocument(doc) {
+    if (!window.confirm(`Delete “${doc.name}” and its indexed chunks?`)) return;
+    setDocBusy(doc.id); setStatus(null);
+    try {
+      await api.delete(`/documents/${encodeURIComponent(doc.id)}`);
+      await reloadDocs();
+      setStatus({ type: 'success', text: `Removed ${doc.name}` });
+    } catch (err) { setStatus({ type: 'error', text: catchError(err) }); }
+    finally { setDocBusy(null); }
+  }
+
+  async function clearChat() {
+    if (queryBusy || clearingChat || historyLoading) return;
+    if (!window.confirm('Delete your saved chat history? This cannot be undone. Uploaded documents will stay.')) return;
+    setClearingChat(true);
+    try {
+      await api.delete('/chat/history');
+      setMessages([]);
+      setStatus({ type: 'success', text: 'Saved chat cleared. Documents are unchanged.' });
+    } catch (err) {
+      setStatus({ type: 'error', text: catchError(err) });
+    } finally { setClearingChat(false); }
+  }
+
+  async function sendQuestion(e) {
+    e?.preventDefault();
+    const q = question.trim();
+    if (!q || queryBusy || clearingChat || historyLoading || !docs.length) return;
+    setQuestion(''); setMessages(prev => [...prev, { role: 'user', text: q }]);
+    setQueryBusy(true);
+    try {
+      const { data } = await api.post('/query', { question: q });
+      setMessages(prev => [...prev, { role: 'assistant', text: data.answer,
+        sources: data.sources || [], confidence: data.confidence,
+        reason: data.reason, bestDistance: data.best_distance }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', text: catchError(err), error: true, sources: [] }]);
+    } finally { setQueryBusy(false); }
+  }
+
+  return <div className="app-shell">
+    <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
+      <div className="sidebar-top">
+        <div className="brand"><span className="brand-mark">{LOGO}</span><span>DocuSphere <b>AI</b></span></div>
+        <p className="brand-desc">Your private documentation assistant</p>
+      </div>
+      <div className="sidebar-content">
+        <section>
+          <div className="section-heading"><span>ADD DOCUMENT</span><span>01</span></div>
+          <form onSubmit={ingestPdf} className="stack">
+            <label htmlFor="pdf-upload" className="file-picker">
+              <span className="file-symbol">↑</span>
+              <span>{file ? file.name : 'Choose a PDF file'}</span>
+              <small>Text-based PDF · Max 10 MB</small>
+            </label>
+            <input ref={fileRef} id="pdf-upload" type="file" accept=".pdf,application/pdf"
+              className="visually-hidden" onChange={e => setFile(e.target.files?.[0] || null)} />
+            <button className="primary wide" disabled={!file || ingesting}>{ingesting ? 'Processing…' : 'Upload PDF'}</button>
+          </form>
+        </section>
+        <section>
+          <div className="section-heading"><span>ADD WEBPAGE</span><span>02</span></div>
+          <form onSubmit={ingestUrl} className="stack">
+            <input className="field" type="url" placeholder="https://docs.example.com" value={url}
+              onChange={e => setUrl(e.target.value)} required />
+            <button className="secondary wide" disabled={!url.trim() || ingesting}>{ingesting ? 'Processing…' : 'Ingest URL ↗'}</button>
+          </form>
+        </section>
+        {status && <div role="status" className={`alert ${status.type}`}>{status.text}</div>}
+        <section className="documents-section">
+          <div className="section-heading"><span>MY DOCUMENTS</span><span>{docs.length}</span></div>
+          {docs.length === 0 ? <div className="doc-empty">No documents yet.<br />Add a PDF or webpage to start.</div> :
+            <div className="doc-list">{docs.map(doc =>
+              <div className="doc-row" key={doc.id} title={doc.name}>
+                <span className="doc-symbol">{doc.type === 'pdf' ? '▤' : '↗'}</span>
+                <div className="doc-info"><strong>{doc.name}</strong><small>{doc.chunks} chunks · {doc.type.toUpperCase()}</small></div>
+                <button className="icon-btn danger-hover" title={`Delete ${doc.name}`} aria-label={`Delete ${doc.name}`}
+                  disabled={docBusy === doc.id} onClick={() => deleteDocument(doc)}>×</button>
+              </div>
+            )}</div>}
+        </section>
+      </div>
+      <div className="account-row">
+        <span className="avatar">{user.email.slice(0, 1).toUpperCase()}</span>
+        <div className="account-info"><strong>{user.email}</strong><small>Private workspace</small></div>
+        <button className="icon-btn" onClick={onLogout} title="Sign out" aria-label="Sign out">⇥</button>
+      </div>
+    </aside>
+
+    <main className="chat-main">
+      <header className="chat-header">
+        <button className="menu-button" onClick={() => setSidebarOpen(!sidebarOpen)} aria-label="Toggle document sidebar">☰</button>
+        <div><div className="chat-title">Ask your documentation</div><div className="chat-subtitle">Relevant evidence from your uploaded sources</div></div>
+        <button className="clear-button" onClick={clearChat} disabled={queryBusy || clearingChat || historyLoading}>
+          {clearingChat ? 'Clearing…' : 'Clear chat'}
+        </button>
+      </header>
+      <div className="chat-area">
+        {historyLoading && <div className="welcome"><p>Loading your saved conversation…</p></div>}
+        {!historyLoading && messages.length === 0 && <div className="welcome">
+          <div className="welcome-orbit">{LOGO}</div>
+          <div className="eyebrow">YOUR KNOWLEDGE, INSTANTLY ACCESSIBLE</div>
+          <h1>Your documents.<br /><span>Answers that matter.</span></h1>
+          <p>Add your PDFs or webpages to the workspace, then ask a question in natural language.</p>
+          <div className="welcome-steps"><span>01 · Upload</span><span>→</span><span>02 · Ask</span><span>→</span><span>03 · Explore sources</span></div>
+        </div>}
+        {messages.map((msg, idx) => <div key={idx} className={`message-row ${msg.role}`}>
+          {msg.role === 'assistant' && <div className="bot-avatar">{LOGO}</div>}
+          <div className={`bubble ${msg.role === 'user' ? 'user-bubble' : 'assistant-bubble'}`}>
+            {msg.role === 'assistant' ? <div className="markdown"><ReactMarkdown
+              remarkPlugins={[[inlineSourceCitationPlugin, { maxNumber: msg.sources?.length || 0, messageIndex: idx }]]}
+              components={{ a: MarkdownLink }}
+            >{msg.text}</ReactMarkdown></div> : <p>{msg.text}</p>}
+            {msg.role === 'assistant' && !msg.error && <div className="result-meta">
+              <span className={`evidence-badge ${msg.confidence === 'retrieved' ? 'matched' : 'nomatch'}`}>
+                {msg.confidence === 'retrieved' ? '◉ Retrieved evidence' :
+                  msg.reason === 'llm_abstained' ? '○ Answer not supported by context' :
+                  msg.reason === 'distance_gate' ? '○ Search relevance below threshold' :
+                  '○ No indexed match'}
+              </span><span className="evidence-note">Not a factual guarantee</span>
+            </div>}
+            {msg.role === 'assistant' && !msg.error && msg.confidence !== 'retrieved' &&
+              <div className="retrieval-diagnostic">
+                <strong>Search diagnostic:</strong>{' '}
+                {msg.reason || 'No diagnostic reason returned; check backend version'}
+                {' · '}Best cosine distance: {typeof msg.bestDistance === 'number' ? msg.bestDistance.toFixed(3) : 'none'}
+                <div className="diagnostic-note">Distance is not an accuracy score. Check retrieved excerpts before changing the cutoff.</div>
+              </div>}
+            {msg.sources?.length > 0 && <div className="sources-section">
+              <div className="sources-label">{msg.confidence === 'retrieved' ? 'RETRIEVED SOURCE EXCERPTS' : 'CANDIDATE EXCERPTS — NO ANSWER VERIFIED'}</div>
+              {msg.sources.map((s, i) => <SourceReference key={`${s.document_id}:${i}`} source={s} index={i} messageIndex={idx} />)}
+            </div>}
+          </div>
+        </div>)}
+        {queryBusy && <div className="message-row assistant"><div className="bot-avatar">{LOGO}</div><div className="bubble assistant-bubble thinking"><span /><span /><span /></div></div>}
+        <div ref={bottomRef} />
+      </div>
+      <div className="composer-wrap"><form className="composer" onSubmit={sendQuestion}>
+        <textarea value={question} onChange={e => setQuestion(e.target.value)} rows={2}
+          placeholder={docs.length ? 'Ask a question about your documents…' : 'Add a document to begin…'}
+          disabled={!docs.length || queryBusy || historyLoading || clearingChat}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuestion(); } }} />
+        <button className="send-button" disabled={!question.trim() || !docs.length || queryBusy || historyLoading || clearingChat} aria-label="Send question">↑</button>
+      </form><div className="composer-caption">Answers are AI-generated. Verify important facts in source excerpts. · Enter to send, Shift+Enter for newline.</div></div>
+    </main>
+    {sidebarOpen && <button className="mobile-overlay" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar" />}
+  </div>;
+}
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [checking, setChecking] = useState(!!sessionStorage.getItem(STORAGE_TOKEN));
+  const logout = useCallback(() => { sessionStorage.removeItem(STORAGE_TOKEN); setUser(null); setChecking(false); }, []);
+  useEffect(() => {
+    if (!sessionStorage.getItem(STORAGE_TOKEN)) return;
+    let live = true;
+    api.get('/auth/me').then(({ data }) => { if (live) setUser(data); })
+      .catch(() => { if (live) logout(); })
+      .finally(() => { if (live) setChecking(false); });
+    return () => { live = false; };
+  }, [logout]);
+  if (checking) return <div className="loading-screen">{LOGO} Loading your workspace…</div>;
+  if (!user) return <AuthScreen onAuthenticated={setUser} />;
+  return <Workspace key={user.id} user={user} onLogout={logout} />;
+}

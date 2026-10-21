@@ -1,337 +1,149 @@
-from langchain_huggingface import HuggingFaceEmbeddings
-from fastapi import FastAPI, HTTPException, UploadFile, File
+"""DocuSphere v2: FastAPI app with local login, private document access and RAG."""
+import logging
+import sqlite3
+import uuid
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from langchain_core.prompts import PromptTemplate
-from langchain_chroma import Chroma
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain_groq import ChatGroq
-from dotenv import load_dotenv
-import chromadb
-import pdfplumber
-import httpx
-from bs4 import BeautifulSoup
-import os
-import tempfile
+from pydantic import BaseModel, EmailStr, Field
+from starlette.concurrency import run_in_threadpool
 
-# ===== 1. ENVIRONMENT SETUP =====
-load_dotenv()
-if not os.getenv("GROQ_API_KEY"):
-    print("ERROR: .env me GROQ_API_KEY missing hai!")
-    exit()
+from auth import (create_token, ensure_secret, get_current_user,
+                  hash_password, verify_password)
+from config import MAX_PDF_BYTES
+from database import (init_db, find_user_by_email, add_user, list_documents,
+                      find_document, remove_document, save_chat_turn,
+                      load_chat_messages, delete_chat_history)
+from rag import (answer, delete_vectors_for_document, extract_pdf_pages,
+                 extract_public_webpage, ingest_sections)
 
-app = FastAPI(title="DocuSphere AI", version="1.0.0")
+logger = logging.getLogger(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    ensure_secret()
+    yield
 
-# ===== 2. PYDANTIC MODELS =====
+app = FastAPI(title='DocuSphere AI', version='2.0.0', lifespan=lifespan)
+app.add_middleware(CORSMiddleware,
+    allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'],
+    allow_credentials=False, allow_methods=['GET','POST','DELETE'],
+    allow_headers=['Authorization','Content-Type'])
+
+class AuthRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
 class UrlRequest(BaseModel):
-    url: str
+    url: str = Field(min_length=8, max_length=2048)
 
 class QueryRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=1, max_length=2000)
 
-# ===== 3. MODELS + DB SETUP =====
-print("Loading models...")
-
-embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2")
-chroma_client = chromadb.PersistentClient(path="./my_local_db")
-vectorstore = Chroma(
-    client=chroma_client,
-    collection_name="docusphere_collection",
-    embedding_function=embeddings,
-    collection_metadata={"hnsw:space": "cosine"}
-)
-
-retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 5}
-)
-
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0.1
-)
-
-print("Server ready!")
-
-# ===== 4. PROMPT TEMPLATE =====
-PROMPT_TEMPLATE = """You are a helpful documentation assistant.
-Read the context carefully and answer the question directly.
-Extract specific facts, numbers, names from the context.
-If the information is present anywhere in the context, use it.
-Only say "I cannot find this in the provided documentation" if the information is truly absent.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:"""
-
-prompt = PromptTemplate(
-    template=PROMPT_TEMPLATE,
-    input_variables=["context", "question"]
-)
-
-# ===== 5. QA CHAIN =====
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=retriever,
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": prompt}
-)
-
-# ===== 6. IN-MEMORY TRACKER =====
-ingested_docs = []
-
-# ===== 7. DYNAMIC CHUNK SIZE =====
-# Document size ke hisaab se automatically chunk size decide karta hai
-# Resume/short doc → 150 chars (ek line per chunk — better precision)
-# Medium doc → 500 chars (paragraph level)
-# Large doc → 1000 chars (multi-paragraph — preserve context)
-def get_chunk_size(text: str):
-    length = len(text)
-    if length < 2000:
-        return 150, 50
-    elif length < 50000:
-        return 500, 150
-    else:
-        return 1000, 200
-
-
-# ===== API ENDPOINTS =====
-
-@app.get("/health")
+@app.get('/health')
 def health_check():
-    return {"status": "ok", "message": "DocuSphere backend is running"}
+    return {'status': 'ok', 'version': '2.0.0'}
 
-
-@app.post("/ingest/pdf")
-async def ingest_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files accepted")
-
+@app.post('/auth/register', status_code=201)
+def register(body: AuthRequest):
+    email = str(body.email).lower().strip()
+    if find_user_by_email(email):
+        raise HTTPException(status_code=409, detail='Email already registered')
+    user_id = str(uuid.uuid4())
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        add_user(user_id, email, hash_password(body.password))
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail='Email already registered')
+    return {'access_token': create_token(user_id), 'token_type': 'bearer',
+            'user': {'id': user_id, 'email': email}}
 
-        raw_text = ""
-        with pdfplumber.open(tmp_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    raw_text += page_text + "\n"
+@app.post('/auth/login')
+def login(body: AuthRequest):
+    user = find_user_by_email(str(body.email).lower().strip())
+    if not user or not verify_password(body.password, user['password_hash']):
+        raise HTTPException(status_code=401, detail='Invalid email or password')
+    return {'access_token': create_token(user['id']), 'token_type': 'bearer',
+            'user': {'id': user['id'], 'email': user['email']}}
 
-        os.unlink(tmp_path)
+@app.get('/auth/me')
+def me(user=Depends(get_current_user)):
+    return user
 
-        if not raw_text.strip():
-            raise HTTPException(
-                status_code=422,
-                detail="PDF se text extract nahi hua. Scanned image PDF ho sakta hai."
-            )
+@app.get('/documents')
+def documents(user=Depends(get_current_user)):
+    return {'documents': list_documents(user['id'])}
 
-        # Dynamic chunking — document size ke hisaab se
-        chunk_size, chunk_overlap = get_chunk_size(raw_text)
-        print(f"PDF size: {len(raw_text)} chars | chunk_size: {chunk_size} | overlap: {chunk_overlap}")
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""]
-        )
-
-        chunks = text_splitter.split_text(raw_text)
-
-        vectorstore.add_texts(
-            texts=chunks,
-            metadatas=[{
-                "source": file.filename,
-                "type": "pdf",
-                "chunk_index": i
-            } for i in range(len(chunks))]
-        )
-
-        ingested_docs.append({
-            "name": file.filename,
-            "type": "pdf",
-            "chunks": len(chunks),
-            "chunk_size": chunk_size
-        })
-
-        return {
-            "message": "PDF successfully ingested",
-            "filename": file.filename,
-            "chunks_created": len(chunks),
-            "chunk_size_used": chunk_size
-        }
-
+@app.post('/ingest/pdf', status_code=201)
+async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user)):
+    filename = (file.filename or '').split('/')[-1].split('\\')[-1][:180]
+    if not filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail='Only PDF files are accepted')
+    content = await file.read(MAX_PDF_BYTES + 1)
+    await file.close()
+    if len(content) > MAX_PDF_BYTES:
+        raise HTTPException(status_code=413, detail='PDF too large; max 10 MB')
+    if not content.startswith(b'%PDF-'):
+        raise HTTPException(status_code=422, detail='File is not a valid PDF')
+    sections = await run_in_threadpool(extract_pdf_pages, content)
+    try:
+        return await run_in_threadpool(ingest_sections, user['id'], filename, 'pdf', sections)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF ingestion failed: {str(e)}")
+    except Exception as error:
+        logger.exception('PDF ingestion error')
+        raise HTTPException(status_code=500, detail='Unable to ingest PDF') from error
 
-
-@app.post("/ingest/url")
-async def ingest_url(request: UrlRequest):
-    url = request.url.strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="URL required")
-
+@app.post('/ingest/url', status_code=201)
+async def ingest_url(body: UrlRequest, user=Depends(get_current_user)):
+    text, final_url = await extract_public_webpage(body.url)
+    parsed = urlparse(final_url)
+    name = f'{parsed.netloc}{parsed.path}'[:180] or 'Web document'
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            response = await client.get(url)
-
-        if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="URL not found (404)")
-        if response.status_code == 403:
-            raise HTTPException(status_code=403, detail="Access denied (403) — paywall ya login required")
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"URL fetch failed: HTTP {response.status_code}")
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
-            tag.decompose()
-
-        raw_text = soup.get_text(separator="\n", strip=True)
-
-        if not raw_text.strip():
-            raise HTTPException(status_code=422, detail="URL se meaningful text extract nahi hua")
-
-        # Dynamic chunking
-        chunk_size, chunk_overlap = get_chunk_size(raw_text)
-        print(f"URL size: {len(raw_text)} chars | chunk_size: {chunk_size} | overlap: {chunk_overlap}")
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""]
-        )
-
-        chunks = text_splitter.split_text(raw_text)
-
-        vectorstore.add_texts(
-            texts=chunks,
-            metadatas=[{
-                "source": url,
-                "type": "url",
-                "chunk_index": i
-            } for i in range(len(chunks))]
-        )
-
-        doc_name = url.split("/")[-1] or url
-        ingested_docs.append({
-            "name": doc_name,
-            "type": "url",
-            "url": url,
-            "chunks": len(chunks),
-            "chunk_size": chunk_size
-        })
-
-        return {
-            "message": "URL successfully ingested",
-            "url": url,
-            "chunks_created": len(chunks),
-            "chunk_size_used": chunk_size
-        }
-
+        return await run_in_threadpool(ingest_sections, user['id'], name, 'url', [(None, text)], final_url)
     except HTTPException:
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=408, detail="URL fetch timeout — site respond nahi kar raha")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"URL ingestion failed: {str(e)}")
+    except Exception as error:
+        logger.exception('URL ingestion error')
+        raise HTTPException(status_code=500, detail='Unable to ingest URL') from error
 
+@app.get('/chat/history')
+def chat_history(user=Depends(get_current_user)):
+    return {'messages': load_chat_messages(user['id'])}
 
-@app.post("/query")
-async def query_docs(request: QueryRequest):
-    question = request.question.strip()
+@app.delete('/chat/history')
+def clear_chat_history(user=Depends(get_current_user)):
+    delete_chat_history(user['id'])
+    return {'cleared': True}
+
+@app.post('/query')
+def query(body: QueryRequest, user=Depends(get_current_user)):
+    question = body.question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Question required")
-
+        raise HTTPException(status_code=400, detail='Question cannot be empty')
+    if not list_documents(user['id']):
+        return {'answer': 'Please upload a document first.', 'sources': [],
+                'confidence': 'no_match', 'matched_chunks': 0}
     try:
-        # Query rewriting — natural language ko key terms mein convert karo
-        # Better retrieval ke liye — "Which college does Adarsh study in?" → "Adarsh college university"
-        rewrite_prompt = f"""Convert this question into 3-5 key search terms only. No sentences, just keywords.
-Question: {question}
-Keywords:"""
+        result = answer(user['id'], question)
+        save_chat_turn(user['id'], question, result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception('Query failed')
+        raise HTTPException(status_code=502, detail='Answer generation failed. Check embedding model/Groq API.') from error
 
-        rewrite_response = llm.invoke(rewrite_prompt)
-        search_query = rewrite_response.content.strip()
-
-        print(f"\n=== ORIGINAL: {question} ===")
-        print(f"=== REWRITTEN: {search_query} ===")
-
-        # Rewritten query se similarity search
-        docs_with_scores = vectorstore.similarity_search_with_score(search_query, k=5)
-
-        print("Scores:")
-        for doc, score in docs_with_scores:
-            print(f"  Score: {score:.4f} | {doc.page_content[:80]}")
-        print("=" * 40)
-
-        # Confidence gate
-        # Cosine similarity: higher = better (0 to 1)
-        # Score < 0.3 matlab koi relevant chunk nahi mila — LLM call nahi karni
-        if not docs_with_scores or docs_with_scores[0][1] < 0.3:
-            return {
-                "answer": "I cannot find relevant information for this query in the provided documentation.",
-                "sources": [],
-                "confidence": "low"
-            }
-
-        # Original question se generate karo — better answer quality
-        response = qa_chain.invoke({"query": question})
-
-        sources = []
-        seen = set()
-        for doc in response.get("source_documents", []):
-            source_name = doc.metadata.get("source", "Unknown")
-            if source_name not in seen:
-                seen.add(source_name)
-                sources.append({
-                    "document": source_name,
-                    "excerpt": doc.page_content[:200] + "..."
-                })
-
-        return {
-            "answer": response["result"],
-            "sources": sources,
-            "confidence": "high"
-        }
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-
-        error_msg = str(e).lower()
-        if "429" in error_msg or "rate limit" in error_msg:
-            raise HTTPException(status_code=429, detail="API overloaded. Thodi der baad try karo.")
-        elif "timeout" in error_msg:
-            raise HTTPException(status_code=504, detail="AI model timeout.")
-        else:
-            raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-
-@app.get("/documents")
-def list_documents():
-    return {
-        "documents": ingested_docs,
-        "total": len(ingested_docs)
-    }
-
-
-
-# cd C:\Users\Adarsh\OneDrive\Desktop\docusphere-frontend
+@app.delete('/documents/{document_id}')
+def delete_document(document_id: str, user=Depends(get_current_user)):
+    if not find_document(user['id'], document_id):
+        raise HTTPException(status_code=404, detail='Document not found')
+    try:
+        delete_vectors_for_document(document_id)
+        remove_document(user['id'], document_id)
+    except Exception as error:
+        logger.exception('Document delete failed')
+        raise HTTPException(status_code=502, detail='Could not delete document') from error
+    return {'deleted': True, 'document_id': document_id}

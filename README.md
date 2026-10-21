@@ -1,165 +1,78 @@
-# ⬡ DocuSphere AI
+# DocuSphere AI
 
-> **RAG-powered documentation assistant** — ingest any PDF or URL, then chat with your docs using AI.
+A local-first RAG documentation assistant built with **React**, **FastAPI**, **LangChain**, **ChromaDB** and a **Groq-hosted language model**. Upload a text-based PDF or ingest a public webpage, then ask questions and inspect retrieved source excerpts.
 
-Built with **FastAPI + LangChain + ChromaDB** on the backend and **React** on the frontend.
+## Features
 
----
+- Email/password signup and login with hashed passwords and JWT authentication.
+- Per-user document records and retrieval filtering.
+- Ingest text-based PDFs with page metadata and public HTML webpages.
+- Recursive character chunking, Hugging Face embeddings (`all-mpnet-base-v2`) and ChromaDB vector search.
+- Configurable cosine-distance relevance gate, optional query rewriting and source excerpts.
+- Clickable inline source references that navigate to retrieved excerpts.
+- SQLite-persisted document list and per-user chat history (restored after refresh or login).
+- Delete an ingested document or clear your saved chat.
 
-## 🖥️ Demo
+## Repository layout
 
-| Sidebar — Ingest Docs | Chat — Ask Questions |
-|---|---|
-| Upload PDFs or paste URLs | Get grounded, sourced answers |
-
----
-
-## 🏗️ Architecture
-
-```
-docusphere/
-├── backend/          # FastAPI + LangChain RAG pipeline
-│   ├── main.py       # API endpoints + RAG logic
-│   ├── run_server.py # Uvicorn server entry point
-│   ├── requirements.txt
-│   └── .env          # API keys (not committed)
-│
-└── frontend/         # React chat interface
-    ├── src/
-    │   ├── App.js    # Main UI component
-    │   └── index.css # Tailwind CSS
-    └── package.json
+```text
+DocuSphere-AI/
+├── docusphere-backend/    # FastAPI, JWT, SQLite, RAG, ChromaDB, tests
+├── docusphere-frontend/   # React UI and Axios client
+├── README.md
+└── .gitignore
 ```
 
----
+## Local setup (Windows / PowerShell)
 
-## ⚙️ How It Works
+Requires **Python 3.11** and a recent **Node.js LTS** release, plus a [Groq API key](https://console.groq.com/keys).
 
-1. **Ingest** — User uploads a PDF or pastes a URL
-2. **Chunk** — Text is split dynamically based on document size (150–1000 chars per chunk)
-3. **Embed** — Chunks are embedded using `all-mpnet-base-v2` (HuggingFace)
-4. **Store** — Embeddings stored in ChromaDB (local persistent vector store)
-5. **Query** — User asks a question → query is rewritten into keywords → similarity search → LLM answers using retrieved context
-6. **Respond** — Answer returned with source excerpts and confidence badge
+### Backend
 
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-- Python 3.11+
-- Node.js 18+
-- [Groq API Key](https://console.groq.com/keys) (free)
-
----
-
-### Backend Setup
-
-```bash
-# 1. Go to backend folder
-cd backend
-
-# 2. Create and activate virtual environment
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Mac/Linux
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Create .env file
-GROQ_API_KEY=your_groq_api_key_here
-
-# 5. Start server
-python run_server.py
+```powershell
+cd docusphere-backend
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Backend runs at `http://127.0.0.1:8000`
+Edit `docusphere-backend/.env`: replace `GROQ_API_KEY` with your real API key and `JWT_SECRET` with the generated secret (32+ characters). Keep `.env` private. The default LLM is `openai/gpt-oss-20b` via Groq. Then start the backend:
 
----
+```powershell
+.\.venv\Scripts\python.exe run_server.py
+```
 
-### Frontend Setup
+Check <http://127.0.0.1:8000/health> or browse the interactive FastAPI docs at <http://127.0.0.1:8000/docs>. The public Hugging Face embedding model downloads on the first run.
 
-```bash
-# 1. Go to frontend folder
-cd frontend
+### Frontend (new terminal from the repository root)
 
-# 2. Install dependencies
+```powershell
+cd docusphere-frontend
 npm install
-
-# 3. Start dev server
 npm start
 ```
 
-Frontend runs at `http://localhost:3000`
+Open <http://localhost:3000>. The frontend defaults to `http://127.0.0.1:8000` for API calls.
 
----
+## API overview
 
-## 🔌 API Endpoints
+| Method | Endpoint | Function |
+| --- | --- | --- |
+| GET | `/health` | Health check |
+| POST | `/auth/register` | Register an account |
+| POST | `/auth/login` | Sign in |
+| GET | `/auth/me` | Current user |
+| POST | `/ingest/pdf` | Ingest a PDF |
+| POST | `/ingest/url` | Ingest a webpage |
+| GET | `/documents` | List owned documents |
+| DELETE | `/documents/{document_id}` | Remove an owned document |
+| POST | `/query` | Ask a grounded question |
+| GET | `/chat/history` | Load saved messages |
+| DELETE | `/chat/history` | Clear saved messages |
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health` | Server health check |
-| `POST` | `/ingest/pdf` | Upload and ingest a PDF file |
-| `POST` | `/ingest/url` | Ingest content from a URL |
-| `POST` | `/query` | Ask a question against ingested docs |
-| `GET` | `/documents` | List all ingested documents |
+## Data and security
 
----
+ChromaDB embeddings, SQLite user accounts and chat history live in `docusphere-backend/data/` and are **not committed**. The `.env` file containing secrets is ignored. `.env.example` contains only placeholders. Passwords are stored as hashes.
 
-## 🧠 Tech Stack
-
-### Backend
-| Tool | Purpose |
-|---|---|
-| FastAPI | REST API framework |
-| LangChain | RAG pipeline orchestration |
-| ChromaDB | Local vector database |
-| HuggingFace (`all-mpnet-base-v2`) | Text embeddings |
-| Groq (`llama-3.1-8b-instant`) | LLM for answer generation |
-| pdfplumber | PDF text extraction |
-| httpx + BeautifulSoup | URL scraping |
-
-### Frontend
-| Tool | Purpose |
-|---|---|
-| React 18 | UI framework |
-| Axios | API calls |
-| react-markdown | Render AI responses with formatting |
-| react-dropzone | Drag-and-drop PDF upload |
-| Tailwind CSS | Styling |
-
----
-
-## ✨ Features
-
-- 📄 **PDF Ingestion** — Upload any text-based PDF
-- 🔗 **URL Ingestion** — Scrape and ingest any public webpage
-- 💬 **Chat Interface** — ChatGPT-style conversation UI
-- 🔍 **Query Rewriting** — Questions auto-converted to search keywords for better retrieval
-- 📎 **Source Citations** — Every answer shows which document it came from
-- ✅ **Confidence Badge** — "Grounded" or "No match" shown per response
-- ⚡ **Dynamic Chunking** — Chunk size auto-adjusts based on document length
-
----
-
-## 🔒 Environment Variables
-
-Create a `.env` file in the `backend/` folder:
-
-```env
-GROQ_API_KEY=your_groq_api_key_here
-```
-
-## 📌 Notes
-
-- ChromaDB stores data locally in `backend/my_local_db/` — this folder is excluded from git
-- The embedding model (`all-mpnet-base-v2`) downloads automatically on first run (~420MB)
-- Scanned/image PDFs are not supported — only text-based PDFs work
-
----
-
-## 👨‍💻 Author
-
-**Adarsh Beriwala**  
-[GitHub](https://github.com/Adarsh-Beriwala)
+This is an interview/demo application, **not a production security audit**. Publicly hosted URL ingestion would need additional server-side request forgery (SSRF) hardening. A low cosine distance is not proof that a passage supports the answer; prompt instructions and the relevance gate reduce some unsupported answers but do not eliminate hallucinations. Inline citations are navigable pointers to retrieved excerpts, not verified sentence-level citations. The previously observed raw-string false rejection remains a known retrieval issue that requires further diagnostics.
