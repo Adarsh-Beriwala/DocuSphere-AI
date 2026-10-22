@@ -1,51 +1,128 @@
 # DocuSphere AI
 
-A local-first RAG documentation assistant built with **React**, **FastAPI**, **LangChain**, **ChromaDB** and a **Groq-hosted language model**. Upload a text-based PDF or ingest a public webpage, then ask questions and inspect retrieved source excerpts.
+**Ask questions from PDFs and documentation websites — and see where the answers come from.**
 
-## Features
+DocuSphere AI is a full-stack, **Retrieval-Augmented Generation (RAG)** documentation assistant. Instead of searching through long PDFs or webpages manually, you can add a document, ask a question in plain English, and get an answer based on the information retrieved from your content.
 
-- Email/password signup and login with hashed passwords and JWT authentication.
-- Per-user document records and retrieval filtering.
-- Ingest text-based PDFs with page metadata and public HTML webpages.
-- Recursive character chunking, Hugging Face embeddings (`all-mpnet-base-v2`) and ChromaDB vector search.
-- Configurable cosine-distance relevance gate, optional query rewriting and source excerpts.
-- Clickable inline source references that navigate to retrieved excerpts.
-- SQLite-persisted document list and per-user chat history (restored after refresh or login).
-- Delete an ingested document or clear your saved chat.
+Built with **React, FastAPI, LangChain, ChromaDB, and a Groq-hosted language model**.
 
-## Repository layout
+## What Can You Do?
+
+- **Upload a PDF** or paste a **public documentation URL** to make its text searchable.
+- **Ask questions naturally** without having to search through the document yourself.
+- **View the sources** behind an answer using clickable references and text excerpts.
+- **Keep your documents private** with login and user-specific document retrieval.
+- **Pick up where you left off**: uploaded document records and chat history are saved across refreshes.
+- **Manage your workspace** by deleting indexed documents or clearing chat history.
+
+## How It Works
+
+DocuSphere has two main flows:
+
+**1. Document ingestion — making your content searchable**
 
 ```text
-DocuSphere-AI/
-├── docusphere-backend/    # FastAPI, JWT, SQLite, RAG, ChromaDB, tests
-├── docusphere-frontend/   # React UI and Axios client
-├── README.md
-└── .gitignore
+PDF / Public Webpage
+        ↓
+   Text Extraction
+        ↓
+ Chunking + Overlap
+        ↓
+  MPNet Embeddings
+        ↓
+      ChromaDB
 ```
 
-## Local setup (Windows / PowerShell)
+- **PDFs:** `pdfplumber` extracts text and keeps page information when available.
+- **Webpages:** `httpx` fetches a public HTML page; `BeautifulSoup` extracts its readable text.
+- **Chunking:** LangChain's recursive splitter divides text into manageable, overlapping chunks.
+- **Embeddings:** `all-mpnet-base-v2` converts chunks into vectors for semantic search.
+- **Storage:** ChromaDB saves the chunks, embeddings, and source metadata for future questions.
 
-Requires **Python 3.11** and a recent **Node.js LTS** release, plus a [Groq API key](https://console.groq.com/keys).
+**2. Question answering — finding and explaining the answer**
 
-### Backend
+```text
+   Your Question
+        ↓
+  Semantic Search
+        ↓
+ Relevant Document Chunks
+        ↓
+ Groq-hosted Language Model
+        ↓
+ Answer + Clickable Sources
+```
+
+The system searches **only the signed-in user's documents**, checks whether the retrieved chunks pass a configurable relevance threshold, and sends the relevant text to the language model as context. By default it retrieves up to **8 chunks** and uses a **0.65 cosine-distance cutoff** (a relevance heuristic, not an accuracy score). If it cannot find a sufficiently relevant match, it can return a *"not found in the documentation"* response instead of generating an answer.
+
+## Tech Stack
+
+| Part | Technology | Purpose |
+| --- | --- | --- |
+| Frontend | React, Axios | Uploads, chat, document list, source viewer |
+| Backend | Python, FastAPI | APIs, authentication, document processing |
+| PDF & web extraction | pdfplumber, httpx, BeautifulSoup | Read text from supported sources |
+| RAG pipeline | LangChain | Text splitting and model integrations |
+| Embedding model | Hugging Face `all-mpnet-base-v2` | Turn text into searchable vectors |
+| Vector database | ChromaDB | Store and retrieve relevant document chunks |
+| Language model | Groq API (default: `openai/gpt-oss-20b`) | Generate context-based answers |
+| Application database | SQLite | Users, document records, saved chats |
+| Authentication | JWT, password hashing | Sign-in and user-specific access |
+
+## Run It Locally
+
+### Prerequisites
+
+- **Python 3.11**
+- **Node.js** (a recent LTS version) and npm
+- A **[Groq API key](https://console.groq.com/keys)**
+- Internet access for dependency installation, the first embedding-model download, and Groq API requests
+
+These commands use **Windows PowerShell**. Open two terminals: one for the backend and one for the frontend.
+
+### Step 1 — Get the project
+
+```powershell
+git clone https://github.com/Adarsh-Beriwala/DocuSphere-AI.git
+cd DocuSphere-AI
+```
+
+### Step 2 — Set up the backend (Terminal 1)
 
 ```powershell
 cd docusphere-backend
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
+```
+
+Open `docusphere-backend/.env` and set:
+
+```dotenv
+GROQ_API_KEY=your_groq_api_key_here
+JWT_SECRET=your_random_secret_here
+```
+
+Generate a secure JWT secret with:
+
+```powershell
 .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Edit `docusphere-backend/.env`: replace `GROQ_API_KEY` with your real API key and `JWT_SECRET` with the generated secret (32+ characters). Keep `.env` private. The default LLM is `openai/gpt-oss-20b` via Groq. Then start the backend:
+Copy the generated value into `JWT_SECRET`. **Never commit your `.env` file or API key.**
+
+Start the backend:
 
 ```powershell
 .\.venv\Scripts\python.exe run_server.py
 ```
 
-Check <http://127.0.0.1:8000/health> or browse the interactive FastAPI docs at <http://127.0.0.1:8000/docs>. The public Hugging Face embedding model downloads on the first run.
+- API server: <http://127.0.0.1:8000>
+- API documentation: <http://127.0.0.1:8000/docs>
 
-### Frontend (new terminal from the repository root)
+### Step 3 — Start the frontend (Terminal 2)
+
+From the **repository root**, run:
 
 ```powershell
 cd docusphere-frontend
@@ -53,26 +130,51 @@ npm install
 npm start
 ```
 
-Open <http://localhost:3000>. The frontend defaults to `http://127.0.0.1:8000` for API calls.
+Open **<http://localhost:3000>** in your browser.
 
-## API overview
+## Using DocuSphere
 
-| Method | Endpoint | Function |
-| --- | --- | --- |
-| GET | `/health` | Health check |
-| POST | `/auth/register` | Register an account |
-| POST | `/auth/login` | Sign in |
-| GET | `/auth/me` | Current user |
-| POST | `/ingest/pdf` | Ingest a PDF |
-| POST | `/ingest/url` | Ingest a webpage |
-| GET | `/documents` | List owned documents |
-| DELETE | `/documents/{document_id}` | Remove an owned document |
-| POST | `/query` | Ask a grounded question |
-| GET | `/chat/history` | Load saved messages |
-| DELETE | `/chat/history` | Clear saved messages |
+1. **Create an account** or sign in.
+2. **Upload a text-based PDF** or enter a public webpage URL.
+3. **Wait for ingestion** to finish; the document will appear in your document list.
+4. **Ask a question** about the uploaded content.
+5. **Open a citation** to inspect the matching source excerpt or PDF page.
+6. **Return later** to see your saved documents and chat history.
 
-## Data and security
+**Supported inputs:** text-based PDFs up to **10 MB / 150 pages**, and public HTML/text webpages up to **1 MB**.
 
-ChromaDB embeddings, SQLite user accounts and chat history live in `docusphere-backend/data/` and are **not committed**. The `.env` file containing secrets is ignored. `.env.example` contains only placeholders. Passwords are stored as hashes.
+**First run tip:** The embedding model downloads the first time it is needed, so initial document processing may take longer.
 
-This is an interview/demo application, **not a production security audit**. Publicly hosted URL ingestion would need additional server-side request forgery (SSRF) hardening. A low cosine distance is not proof that a passage supports the answer; prompt instructions and the relevance gate reduce some unsupported answers but do not eliminate hallucinations. Inline citations are navigable pointers to retrieved excerpts, not verified sentence-level citations. The previously observed raw-string false rejection remains a known retrieval issue that requires further diagnostics.
+## Where Is My Data Stored?
+
+The project uses two local databases, with different jobs:
+
+- **SQLite:** user accounts (hashed passwords), document records, and chat history.
+- **ChromaDB:** extracted text chunks, vector embeddings, and document metadata.
+
+Both are stored under `docusphere-backend/data/`, which is excluded from Git. Indexed text remains available after a normal backend restart as long as those files remain intact. **Original PDF files are not retained as a separate permanent file library.**
+
+Document searches use the authenticated user's identity to filter retrieved chunks.
+
+## Project Structure
+
+```text
+DocuSphere-AI/
+├── docusphere-backend/   # FastAPI, authentication, RAG, databases
+├── docusphere-frontend/  # React interface
+├── README.md
+└── .gitignore
+```
+
+For the available API routes and request formats, open the **[interactive API docs](http://127.0.0.1:8000/docs)** after starting the backend.
+
+## Current Limitations
+
+- **Text-based PDFs only:** scanned or image-only PDFs need OCR, which is not implemented.
+- **Public webpage text:** sites that render content mainly with JavaScript may not extract fully.
+- **Answers are not guaranteed:** semantic similarity and LLM instructions reduce some unsupported answers, but do not eliminate hallucinations.
+- **Local-first setup:** SQLite and ChromaDB need durable external storage or managed alternatives for a production cloud deployment.
+
+---
+
+**DocuSphere AI** — Find relevant information in your documents, ask questions naturally, and inspect the sources behind the answers.
