@@ -168,13 +168,6 @@ DocuSphere-AI/
 
 For the available API routes and request formats, open the **[interactive API docs](http://127.0.0.1:8000/docs)** after starting the backend.
 
-## Current Limitations
-
-- **Text-based PDFs only:** scanned or image-only PDFs need OCR, which is not implemented.
-- **Public webpage text:** sites that render content mainly with JavaScript may not extract fully.
-- **Answers are not guaranteed:** semantic similarity and LLM instructions reduce some unsupported answers, but do not eliminate hallucinations.
-- **Local-first setup:** SQLite and ChromaDB need durable external storage or managed alternatives for a production cloud deployment.
-
 ---
 
 **DocuSphere AI** — Find relevant information in your documents, ask questions naturally, and inspect the sources behind the answers.
